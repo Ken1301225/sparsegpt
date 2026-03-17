@@ -6,6 +6,16 @@ DEV = torch.device('cuda:0')
 
 
 def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=''):
+    """_summary_
+
+    Args:
+        module (_type_): _description_
+        layers (list, optional): _description_. Defaults to [nn.Conv2d, nn.Linear].
+        name (str, optional): _description_. Defaults to ''.
+
+    Returns:
+        返回当前模块树中所有匹配的模块,返回的是在设定的layers里的模块
+    """    
     if type(module) in layers:
         return {name: module}
     res = {}
