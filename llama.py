@@ -62,6 +62,7 @@ def llama_sequential(model, dataloader, dev):
             model(batch[0].to(dev))
         except ValueError:
             pass
+
     layers[0] = layers[0].module
 
     layers[0] = layers[0].cpu()
