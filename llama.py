@@ -23,7 +23,7 @@ def get_llama(model):
     torch.nn.init.normal_ = skip
     from transformers import LlamaForCausalLM
     model = LlamaForCausalLM.from_pretrained(model, torch_dtype='auto')
-    model.seqlen = 2048
+    model.seqlen = 2048 #设置最大上下文长度,这里固定方便校准
     return model
 
 
@@ -40,11 +40,13 @@ def llama_sequential(model, dataloader, dev):
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
+    # 输入的激活
     inps = torch.zeros(
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
     cache = {"i": 0, "attention_mask": None}
 
+    # 相当巧妙的部分, 通过替换nn模块, 使得在前向传播的时候在该模块处抓住激活并且阶段继续推理
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
@@ -62,14 +64,16 @@ def llama_sequential(model, dataloader, dev):
             model(batch[0].to(dev))
         except ValueError:
             pass
-
+    # 缓存所有batch的激活进入inps, 做好数据准备
+    
     layers[0] = layers[0].module
 
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
     model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
-
+    # 保存完成, 把所有的gpu上的模块放回cpu
+    
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
 
@@ -91,10 +95,10 @@ def llama_sequential(model, dataloader, dev):
             sequential = [list(full.keys())]
 
         for names in sequential:
-            subset = {n: full[n] for n in names}
+            subset = {n: full[n] for n in names} # 筛选出需要剪枝的子集
 
             gpts = {}
-            for name in subset:
+            for name in subset: # 这里取出需要剪枝的权重名
                 if (
                     not (args.minlayer <= i < args.maxlayer and args.prune_only in name)
                 ) == (not args.invert):
@@ -115,11 +119,14 @@ def llama_sequential(model, dataloader, dev):
             handles = []
             for name in subset:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
+                # 注册前向传播hook, 在前向传播后触发
             for j in range(args.nsamples):
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                
             for h in handles:
                 h.remove()
-
+            # 注销hook,不注销后续会导致每次调用都hook
+            
             for name in subset:
                 print(i, name)
                 print("Pruning ...")
@@ -131,10 +138,13 @@ def llama_sequential(model, dataloader, dev):
                     percdamp=args.percdamp,
                     blocksize=args.blocksize,
                 )
+                #这里完成剪枝
                 gpts[name].free()
 
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            
+        #再跑一次前向传播产生下一层的激活
 
         layers[i] = layer.cpu()
         del layer

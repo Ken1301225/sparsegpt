@@ -24,22 +24,36 @@ class SparseGPT:
             W = W.flatten(1)
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
+        # 把权重统一为[out_dim,in_dim]的形式
         self.rows = W.shape[0]
         self.columns = W.shape[1]
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
 
     def add_batch(self, inp, out, blocksize=1024):
+        """添加batch, 滑动累计产生H矩阵
+
+        Args:
+            inp (_type_): _description_
+            out (_type_): _description_
+            blocksize (int, optional): _description_. Defaults to 1024.
+        """        
         if DEBUG:
             self.inp1 = inp
             self.out1 = out
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
-        tmp = inp.shape[0]
+        tmp = inp.shape[0] # batchsize, n_sample为累计的样本数
         if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
             if len(inp.shape) == 3:
                 inp = inp.reshape((-1, inp.shape[-1]))
-            inp = inp.t()
+                # 合并前两维变成 [batch*seq_len, embed]
+            inp = inp.t() # [embed, B*S]
+        #NOTE: 滑动累计
+        # H ≈ 2/N * X X^T
+        # H <- H + X'X'^T
+        #   = (n / N) H_old + (2 / N) XX^T
+        # 这里假设 H_old 2/n * X_old X_old^T ,这样更新就相当于2/n * (X_old X_old^T + X X^T)
         self.H *= self.nsamples / (self.nsamples + tmp)
         self.nsamples += tmp
         inp = math.sqrt(2 / self.nsamples) * inp.float()
@@ -61,6 +75,7 @@ class SparseGPT:
 
         tick = time.time()
 
+        # 清理从未被激活的维度
         H = self.H
         del self.H
         dead = torch.diag(H) == 0
@@ -71,37 +86,37 @@ class SparseGPT:
 
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
-        H[diag, diag] += damp
+        H[diag, diag] += damp  #在对角元加正则项
         H = torch.linalg.cholesky(H)
         H = torch.cholesky_inverse(H)
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
 
         mask = None
-
+        # prunen 在组内要减掉多少个权重 和 prunem 每组有多少权重 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
 
-            W1 = W[:, i1:i2].clone()
+            W1 = W[:, i1:i2].clone() 
             Q1 = torch.zeros_like(W1)
             Err1 = torch.zeros_like(W1)
             Losses1 = torch.zeros_like(W1)
-            Hinv1 = Hinv[i1:i2, i1:i2]
+            Hinv1 = Hinv[i1:i2, i1:i2] # [i,i+B]
 
-            if prunen == 0: 
+            if prunen == 0: # 不做半结构化剪枝
                 if mask is not None:
                     mask1 = mask[:, i1:i2]
                 else:
-                    tmp = W1 ** 2 / (torch.diag(Hinv1).reshape((1, -1))) ** 2
-                    thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
+                    tmp = W1 ** 2 / (torch.diag(Hinv1).reshape((1, -1))) ** 2 # 为了做按列广播除法, 转换为行向量
+                    thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)] 
                     mask1 = tmp <= thresh
             else:
                 mask1 = torch.zeros_like(W1) == 1
 
             for i in range(count):
                 w = W1[:, i]
-                d = Hinv1[i, i]
+                d = Hinv1[i, i] # H^{-1}_jj
 
                 if prunen != 0 and i % prunem == 0:
                     tmp = W1[:, i:(i + prunem)] ** 2 / (torch.diag(Hinv1)[i:(i + prunem)].reshape((1, -1))) ** 2
@@ -118,7 +133,7 @@ class SparseGPT:
                 Q1[:, i] = q
                 Losses1[:, i] = (w - q) ** 2 / d ** 2
 
-                err1 = (w - q) / d
+                err1 = (w - q) / d # 相当于保留mask的丢掉非mask的
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
 

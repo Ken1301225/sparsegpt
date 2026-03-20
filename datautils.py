@@ -34,6 +34,7 @@ def get_wikitext2(nsamples, seed, seqlen, model, tokenizer):
 
     random.seed(seed)
     trainloader = []
+    # 这里相当于切块, 切成model的max_len
     for _ in range(nsamples):
         i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
         j = i + seqlen
@@ -81,8 +82,8 @@ def get_c4(nsamples, seed, seqlen, model, tokenizer):
         j = i + seqlen
         inp = trainenc.input_ids[:, i:j]
         tar = inp.clone()
-        tar[:, :-1] = -100
-        trainloader.append((inp, tar))
+        tar[:, :-1] = -100  #构造语言模型的tar, 除了最后一个token其他都是-100, 只计算最后一个token的loss
+        trainloader.append((inp, tar)) 
 
     valenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
     valenc = valenc.input_ids[:, :(256 * seqlen)]
