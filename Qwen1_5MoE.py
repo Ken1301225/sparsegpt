@@ -5,7 +5,6 @@ import torch.nn as nn
 
 from sparsegpt import *
 from modelutils import *
-from quant import *
 
 try:
     import wandb
@@ -14,37 +13,38 @@ except:
     has_wandb = False
 
 
-def get_llama(model):
+def get_Qwen(model):
     import torch
     def skip(*args, **kwargs):
         pass
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-    from transformers import LlamaForCausalLM
-    model = LlamaForCausalLM.from_pretrained(model, torch_dtype='auto')
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(model, torch_dtype='auto')
     model.seqlen = 2048 #设置最大上下文长度,这里固定方便校准
     return model
 
 
 @torch.no_grad()
-def llama_sequential(model, dataloader, dev):
+def Qwen_sequential(model, dataloader, dev):
+    # 必须确保模型是在gpu上的.
     print("Starting...")
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.layers
 
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    model.model.norm = model.model.norm.to(dev)
-    layers[0] = layers[0].to(dev)
+    # model.model.embed_tokens = model.model.embed_tokens.to(dev)
+    # model.model.norm = model.model.norm.to(dev)
+    # layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
     # 输入的激活
     inps = torch.zeros(
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {"i": 0, "attention_mask": None}
+    cache = {"i": 0, "attention_mask": None,"position_ids":None}
 
     # 相当巧妙的部分, 通过替换nn模块, 使得在前向传播的时候在该模块处抓住激活并且阶段继续推理
     class Catcher(nn.Module):
@@ -56,6 +56,7 @@ def llama_sequential(model, dataloader, dev):
             inps[cache["i"]] = inp
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
+            cache["position_ids"] = kwargs["position_ids"]
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -68,31 +69,31 @@ def llama_sequential(model, dataloader, dev):
     
     layers[0] = layers[0].module
 
-    layers[0] = layers[0].cpu()
-    model.model.embed_tokens = model.model.embed_tokens.cpu()
-    model.model.norm = model.model.norm.cpu()
+    # layers[0] = layers[0].cpu()
+    # model.model.embed_tokens = model.model.embed_tokens.cpu()
+    # model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
     # 保存完成, 把所有的gpu上的模块放回cpu
     
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
+    position_ids = cache["position_ids"]
 
     print("Ready.")
 
-    quantizers = {}
     for i in range(len(layers)):
-        layer = layers[i].to(dev)
-        full = find_layers(layer)
+        layer = layers[i]
+        full = find_MoE_layers(layer)
 
-        if args.true_sequential:
-            sequential = [
-                ["self_attn.k_proj", "self_attn.v_proj", "self_attn.q_proj"],
-                ["self_attn.o_proj"],
-                ["mlp.up_proj", "mlp.gate_proj"],
-                ["mlp.down_proj"],
-            ]
-        else:
-            sequential = [list(full.keys())]
+        # if args.true_sequential:
+        #     sequential = [
+        #         ["self_attn.k_proj", "self_attn.v_proj", "self_attn.q_proj"],
+        #         ["self_attn.o_proj"],
+        #         ["mlp.up_proj", "mlp.gate_proj"],
+        #         ["mlp.down_proj"],
+        #     ]
+        # else:
+        sequential = [list(full.keys())]
 
         for names in sequential:
             subset = {n: full[n] for n in names} # 筛选出需要剪枝的子集
@@ -104,11 +105,11 @@ def llama_sequential(model, dataloader, dev):
                 ) == (not args.invert):
                     continue
                 gpts[name] = SparseGPT(subset[name])
-                if args.wbits < 16:
-                    gpts[name].quantizer = Quantizer()
-                    gpts[name].quantizer.configure(
-                        args.wbits, perchannel=True, sym=False, mse=False
-                    )
+                # if args.wbits < 16:
+                #     gpts[name].quantizer = Quantizer()
+                #     gpts[name].quantizer.configure(
+                #         args.wbits, perchannel=True, sym=False, mse=False
+                #     )
 
             def add_batch(name):
                 def tmp(_, inp, out):
@@ -121,7 +122,7 @@ def llama_sequential(model, dataloader, dev):
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
                 # 注册前向传播hook, 在前向传播后触发
             for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
                 
             for h in handles:
                 h.remove()
@@ -131,6 +132,7 @@ def llama_sequential(model, dataloader, dev):
                 print(i, name)
                 print("Pruning ...")
                 sparsity = args.sparsity
+                assert(args.prunen==0 and args.prunem == 0)
                 gpts[name].fasterprune(
                     sparsity,
                     prunen=args.prunen,
@@ -142,11 +144,11 @@ def llama_sequential(model, dataloader, dev):
                 gpts[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
             
         #再跑一次前向传播产生下一层的激活
 
-        layers[i] = layer.cpu()
+        # layers[i] = layer.cpu()
         del layer
         del gpts
         torch.cuda.empty_cache()
@@ -155,11 +157,12 @@ def llama_sequential(model, dataloader, dev):
 
     model.config.use_cache = use_cache
 
-    return quantizers
+    torch.cuda.empty_cache()
+    # return quantizers
 
 
 @torch.no_grad()
-def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
+def Qwen_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
     print("Evaluating ...")
 
     testenc = testenc.input_ids
@@ -169,15 +172,15 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
     model.config.use_cache = False
     layers = model.model.layers
 
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    layers[0] = layers[0].to(dev)
+    # model.model.embed_tokens = model.model.embed_tokens.to(dev)
+    # layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype 
     inps = torch.zeros(
         (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {"i": 0, "attention_mask": None}
 
+    cache = {"i": 0, "attention_mask": None,"position_ids":None}
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
@@ -187,6 +190,7 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
             inps[cache["i"]] = inp
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
+            cache["position_ids"] = kwargs["position_ids"]
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -198,36 +202,39 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
             pass
     layers[0] = layers[0].module
 
-    layers[0] = layers[0].cpu()
-    model.model.embed_tokens = model.model.embed_tokens.cpu()
+    # layers[0] = layers[0].cpu()
+    # model.model.embed_tokens = model.model.embed_tokens.cpu()
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
+    position_ids = cache["position_ids"]
 
     for i in range(len(layers)):
         print(i)
-        layer = layers[i].to(dev)
+        layer = layers[i]
 
-        if args.gmp:
-            subset = find_layers(layer)
-            for name in subset:
-                W = subset[name].weight.data
-                thresh = torch.sort(torch.abs(W.flatten()))[0][
-                    int(W.numel() * args.sparsity)
-                ]
-                W.data[torch.abs(W.data) <= thresh] = 0
+        assert(args.gmp == False)
+
+        # if args.gmp:
+        #     subset = find_layers(layer)
+        #     for name in subset:
+        #         W = subset[name].weight.data
+        #         thresh = torch.sort(torch.abs(W.flatten()))[0][
+        #             int(W.numel() * args.sparsity)
+        #         ]
+        #         W.data[torch.abs(W.data) <= thresh] = 0
 
         for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-        layers[i] = layer.cpu()
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
+        # layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
         inps, outs = outs, inps
 
-    if model.model.norm is not None:
-        model.model.norm = model.model.norm.to(dev)
-    model.lm_head = model.lm_head.to(dev)
+    # if model.model.norm is not None:
+    #     model.model.norm = model.model.norm.to(dev)
+    # model.lm_head = model.lm_head.to(dev)
 
     testenc = testenc.to(dev)
     nlls = []
@@ -235,6 +242,8 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
         hidden_states = inps[i].unsqueeze(0) # [1, seq_len,hidden_state]
         if model.model.norm is not None:
             hidden_states = model.model.norm(hidden_states)
+        if model.model.rotary_emb is not None:
+            hidden_states = model.model.rotary_emb(hidden_states)
         lm_logits = model.lm_head(hidden_states) # [1, seq_len, vocab_size]
         shift_logits = lm_logits[:, :-1, :].contiguous()
         shift_labels = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)][:, 1:]
@@ -258,7 +267,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("model", type=str, help="LlaMA model to load")
+    parser.add_argument("model", type=str, help="Qwen model to load")
     parser.add_argument(
         "dataset",
         type=str,
@@ -322,7 +331,7 @@ if __name__ == "__main__":
         assert has_wandb, "wandb not installed try `pip install wandb`"
         wandb.init(config=args)
 
-    model = get_llama(args.model)
+    model = get_Qwen(args.model)
     model.eval()
 
     dataloader, testloader = get_loaders(
@@ -331,7 +340,7 @@ if __name__ == "__main__":
 
     if (args.sparsity or args.prunen) and not args.gmp:
         tick = time.time()
-        llama_sequential(model, dataloader, DEV)
+        Qwen_sequential(model, dataloader, DEV)
         for n, p in model.named_parameters():
             print(n, torch.mean((p == 0).float()))
             if 'down_proj' in n:
@@ -343,7 +352,7 @@ if __name__ == "__main__":
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
         print("Dataset:", dataset)
-        llama_eval(model, testloader, DEV, dataset, args.log_wandb)
+        Qwen_eval(model, testloader, DEV, dataset, args.log_wandb)
 
     if args.save:
         model.save_pretrained(args.save)
