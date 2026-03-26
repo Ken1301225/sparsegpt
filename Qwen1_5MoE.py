@@ -21,7 +21,7 @@ def get_Qwen(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(model, torch_dtype='auto')
+    model = AutoModelForCausalLM.from_pretrained(model,torch_dtype=torch.float16,device_map="auto")
     model.seqlen = 2048 #设置最大上下文长度,这里固定方便校准
     return model
 
@@ -44,7 +44,7 @@ def Qwen_sequential(model, dataloader, dev):
     inps = torch.zeros(
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {"i": 0, "attention_mask": None,"position_ids":None}
+    cache = {"i": 0, "attention_mask": None,"position_ids":None, 'position_embeddings': None}
 
     # 相当巧妙的部分, 通过替换nn模块, 使得在前向传播的时候在该模块处抓住激活并且阶段继续推理
     class Catcher(nn.Module):
@@ -57,6 +57,7 @@ def Qwen_sequential(model, dataloader, dev):
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
             cache["position_ids"] = kwargs["position_ids"]
+            cache['position_embeddings'] = kwargs['position_embeddings']
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -78,12 +79,12 @@ def Qwen_sequential(model, dataloader, dev):
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
     position_ids = cache["position_ids"]
-
+    position_embeddings = cache['position_embeddings']
     print("Ready.")
 
     for i in range(len(layers)):
         layer = layers[i]
-        full = find_MoE_layers(layer)
+        full = find_MoE_layers(layer,model_name='Qwen1.5')
 
         # if args.true_sequential:
         #     sequential = [
@@ -122,7 +123,7 @@ def Qwen_sequential(model, dataloader, dev):
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
                 # 注册前向传播hook, 在前向传播后触发
             for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids,position_embeddings=position_embeddings)[0]
                 
             for h in handles:
                 h.remove()
@@ -132,7 +133,7 @@ def Qwen_sequential(model, dataloader, dev):
                 print(i, name)
                 print("Pruning ...")
                 sparsity = args.sparsity
-                assert(args.prunen==0 and args.prunem == 0)
+                assert (args.prunen==0 and args.prunem == 0)
                 gpts[name].fasterprune(
                     sparsity,
                     prunen=args.prunen,
@@ -144,7 +145,7 @@ def Qwen_sequential(model, dataloader, dev):
                 gpts[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids,position_embeddings=position_embeddings)[0]
             
         #再跑一次前向传播产生下一层的激活
 
@@ -191,6 +192,8 @@ def Qwen_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
             cache["position_ids"] = kwargs["position_ids"]
+            cache['position_embeddings'] = kwargs['position_embeddings']
+
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -209,12 +212,12 @@ def Qwen_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
     position_ids = cache["position_ids"]
+    position_embeddings = cache['position_embeddings']
 
     for i in range(len(layers)):
         print(i)
         layer = layers[i]
 
-        assert(args.gmp == False)
 
         # if args.gmp:
         #     subset = find_layers(layer)
@@ -226,7 +229,7 @@ def Qwen_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
         #         W.data[torch.abs(W.data) <= thresh] = 0
 
         for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids,position_embeddings=position_embeddings)[0]
         # layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
@@ -241,12 +244,12 @@ def Qwen_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
     for i in range(nsamples):
         hidden_states = inps[i].unsqueeze(0) # [1, seq_len,hidden_state]
         if model.model.norm is not None:
+            hidden_states = hidden_states.to(model.model.norm.weight.device)
             hidden_states = model.model.norm(hidden_states)
-        if model.model.rotary_emb is not None:
-            hidden_states = model.model.rotary_emb(hidden_states)
+        hidden_states = hidden_states.to(model.lm_head.weight.device)
         lm_logits = model.lm_head(hidden_states) # [1, seq_len, vocab_size]
         shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)][:, 1:]
+        shift_labels = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)][:, 1:].to(shift_logits.device)
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
@@ -264,6 +267,9 @@ def Qwen_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
 if __name__ == "__main__":
     import argparse
     from datautils import *
+    import os
+
+
 
     parser = argparse.ArgumentParser()
 
@@ -323,9 +329,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--log_wandb", action="store_true", help="Whether to log to wandb."
     )
+    parser.add_argument(
+        "--gpu_ids", type=str, default="4,5,6,7"
+    )
 
     args = parser.parse_args()
 
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
+    DEV = 'cuda' if torch.cuda.is_available() else 'cpu'
     # init W&B logging
     if args.log_wandb:
         assert has_wandb, "wandb not installed try `pip install wandb`"
@@ -347,6 +358,9 @@ if __name__ == "__main__":
                 break
         print(time.time() - tick)
 
+    if args.save:
+        model.save_pretrained(args.save)
+    
     for dataset in ["wikitext2", "ptb", "c4"]:
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
@@ -354,5 +368,4 @@ if __name__ == "__main__":
         print("Dataset:", dataset)
         Qwen_eval(model, testloader, DEV, dataset, args.log_wandb)
 
-    if args.save:
-        model.save_pretrained(args.save)
+

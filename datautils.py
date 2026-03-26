@@ -1,5 +1,6 @@
 import random
 
+from librosa import cache
 import numpy as np
 import torch
 from datasets import load_dataset
@@ -25,9 +26,9 @@ def get_tokenizer(model):
     return tokenizer
 
 def get_wikitext2(nsamples, seed, seqlen, model, tokenizer):
-    
-    traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+    cache_dir= '/data1/ldk/dataset/wikitext'
+    traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train',cache_dir=cache_dir)
+    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test',cache_dir=cache_dir)
 
     trainenc = tokenizer(" ".join(traindata['text']), return_tensors='pt')
     testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
@@ -63,11 +64,12 @@ def get_ptb(nsamples, seed, seqlen, model, tokenizer):
     return trainloader, testenc
 
 def get_c4(nsamples, seed, seqlen, model, tokenizer):
+    cache_dir = '/data1/ldk/dataset/allenai'
     traindata = load_dataset(
-        'allenai/c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train'
+        'allenai/c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train',cache_dir=cache_dir
     )
     valdata = load_dataset(
-        'allenai/c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
+        'allenai/c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation',cache_dir=cache_dir
     )
 
     random.seed(seed)
