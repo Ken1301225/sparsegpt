@@ -28,7 +28,7 @@ def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=''):
 
 def find_MoE_layers(module, layers=[nn.Linear], name='', model_name = 'Qwen1.5'):
     if 'Qwen' in model_name:
-        if type(module) in layers and 'experts' in name:
+        if type(module) in layers and '.experts.' in name:
             return {name: module}
         res = {}
         for name1, child in module.named_children(): 

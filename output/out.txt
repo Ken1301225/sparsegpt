@@ -1,0 +1,32 @@
+Token indices sequence length is longer than the specified maximum sequence length for this model (2541000 > 32768). Running this sequence through the model will result in indexing errors
+Dataset: wikitext2
+Evaluating ...
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+Perplexity: 12.364826
+README.md: 4.21kB [00:00, 5.72MB/s]
+ptb_text_only.py: 6.50kB [00:00, 8.63MB/s]
+
+

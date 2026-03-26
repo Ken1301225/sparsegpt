@@ -361,7 +361,7 @@ if __name__ == "__main__":
     if args.save:
         model.save_pretrained(args.save)
     
-    for dataset in ["wikitext2", "ptb", "c4"]:
+    for dataset in ["wikitext2",  "c4"]: #"ptb",
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
